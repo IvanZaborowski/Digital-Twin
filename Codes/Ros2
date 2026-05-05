@@ -1,0 +1,345 @@
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import Float32, Int32
+from geometry_msgs.msg import PoseStamped, Twist
+from sensor_msgs.msg import BatteryState, Imu
+import socket
+import threading
+import time
+import csv
+import os
+import numpy as np
+
+class TelloROS(Node):
+    def __init__(self):
+        super().__init__('tello_drone')
+
+        # Connexion au drone
+        self.UDP_IP = '192.168.10.1'
+        self.UDP_PORT = 8889
+        self.STATE_UDP_PORT = 8890
+        self.tello_address = (self.UDP_IP, self.UDP_PORT)
+
+        self.response = None
+        
+        # États du drone (depuis le state packet)
+        self.pitch = self.roll = self.yaw = 0.0
+        self.vgx = self.vgy = self.vgz = 0.0  # Vitesses (cm/s)
+        self.agx = self.agy = self.agz = 0.0  # Accélérations
+        self.battery = 0
+        
+        # Position (depuis VICON)
+        self.pos_x = 0.0
+        self.pos_y = 0.0
+        self.pos_z = 0.0
+        
+        # Dernière commande envoyée
+        self.cmd_left_right = 0      # u_ux (latéral)
+        self.cmd_forward_back = 0    # u_uy (avant/arrière)
+        self.cmd_up_down = 0         # u_uz (montée/descente)
+        self.cmd_yaw = 0             # u_uyaw (rotation)
+        
+        # Timestamp précédent pour calculer dt
+        self.last_timestamp = None
+        self.last_positions = None
+        self.last_velocities = None
+
+        # Sockets
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind(('', self.UDP_PORT))
+        self.stateSocket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.stateSocket.bind(('', self.STATE_UDP_PORT))
+
+        # Threads
+        self.stateThread = threading.Thread(target=self.readStates)
+        self.stateThread.daemon = True
+        self.stateThread.start()
+
+        self.recThread = threading.Thread(target=self.receiveData)
+        self.recThread.daemon = True
+        self.recThread.start()
+
+        self.stateSocket.settimeout(2.0)
+
+        # Publishers (optionnels)
+        self.drone_pose_pub = self.create_publisher(PoseStamped, 'tello/pose', 10)
+        self.drone_imu_pub = self.create_publisher(Imu, 'tello/imu', 10)
+
+        # Subscriber VICON
+        self.vicon_sub = self.create_subscription(
+            PoseStamped,
+            '/vicon/drone/pose',
+            self.vicon_callback,
+            10
+        )
+
+        # Timer pour enregistrement (50 Hz = 0.02s)
+        self.create_timer(0.02, self.record_data)
+
+        # Dataset
+        os.makedirs("dataset_neural_ode", exist_ok=True)
+        self.csv_file = open("dataset_neural_ode/drone_data.csv", "w", newline="")
+        self.writer = csv.writer(self.csv_file)
+        
+        # En-tête compatible Neural ODE (25 colonnes)
+        self.writer.writerow([
+            "t",                                   # temps
+            "s_x", "s_y", "s_z",                   # position (m)
+            "s_roll", "s_pitch", "s_yaw",          # angles (rad)
+            "s_vx", "s_vy", "s_vz",                # vitesse (m/s)
+            "u_ux", "u_uy", "u_uz", "u_uyaw",      # commandes (-1 à 1)
+            "dt",                                  # pas de temps
+            "ds_x", "ds_y", "ds_z",                # dérivée position = vitesse (m/s)
+            "ds_roll", "ds_pitch", "ds_yaw",       # vitesse angulaire (rad/s)
+            "ds_vx", "ds_vy", "ds_vz"              # dérivée vitesse = accélération (m/s²)
+        ])
+
+        self.get_logger().info("TelloROS initialisé - Enregistrement Neural ODE")
+
+    # ============================================
+    # FONCTIONS SOCKET TELLO
+    # ============================================
+    def receiveData(self):
+        while True:
+            try:
+                self.response, _ = self.sock.recvfrom(1024)
+            except:
+                break
+
+    def readStates(self):
+        while True:
+            try:
+                response_state, _ = self.stateSocket.recvfrom(256)
+                response_state = response_state.decode('ASCII')
+                
+                data_list = response_state.replace(';', ':').split(':')
+                
+                # Parsing du state packet Tello
+                self.pitch = float(data_list[1])      # degrés
+                self.roll = float(data_list[3])       # degrés
+                self.yaw = float(data_list[5])        # degrés
+                self.vgx = float(data_list[7])        # cm/s
+                self.vgy = float(data_list[9])        # cm/s
+                self.vgz = float(data_list[11])       # cm/s
+                self.battery = int(data_list[21])
+                self.agx = float(data_list[27])       # accélération
+                self.agy = float(data_list[29])
+                self.agz = float(data_list[31])
+                
+            except Exception as e:
+                pass
+
+    def sendCommand(self, command):
+        self.response = None
+        timestamp = int(time.time() * 1000)
+        self.sock.sendto(command.encode('utf-8'), self.tello_address)
+        print(f"Commande envoyée : {command}")
+        while self.response is None:
+            if (time.time() * 1000) - timestamp > 5 * 1000:
+                print("Timeout")
+                return False
+        print(f"Commande reçue : {self.response}")
+        return self.response
+
+    def rc_control(self, left_right, forward_backward, up_down, yaw):
+        cmd = f"rc {left_right} {forward_backward} {up_down} {yaw}"
+        self.sock.sendto(cmd.encode(), self.tello_address)
+        
+        # Mémoriser la commande pour l'enregistrement
+        self.cmd_left_right = left_right / 100.0   # Normalisation entre -1 et 1
+        self.cmd_forward_back = forward_backward / 100.0
+        self.cmd_up_down = up_down / 100.0
+        self.cmd_yaw = yaw / 100.0
+
+    # ============================================
+    # CALLBACK VICON
+    # ============================================
+    def vicon_callback(self, msg):
+        self.pos_x = msg.pose.position.x
+        self.pos_y = msg.pose.position.y
+        self.pos_z = msg.pose.position.z
+
+    # ============================================
+    # ENREGISTREMENT (format Neural ODE)
+    # ============================================
+    def record_data(self):  # 🔧 OK indentation
+        now = self.get_clock().now()
+        t = now.nanoseconds / 1e9  # timestamp en secondes
+        
+        # Calculer dt
+        if self.last_timestamp is None:
+            dt = 0.02
+        else:
+            dt = t - self.last_timestamp
+        
+        # 🔧 MODIF: sécuriser dt
+        if dt <= 0 or dt > 0.1:
+            dt = 0.02
+
+        # Conversions d'unités
+        vx = self.vgx / 100.0
+        vy = self.vgy / 100.0
+        vz = self.vgz / 100.0
+
+        roll_rad = self.roll * np.pi / 180.0
+        pitch_rad = self.pitch * np.pi / 180.0
+        yaw_rad = self.yaw * np.pi / 180.0
+
+        # 🔧 MODIF: conversion body → world
+        cos_yaw = np.cos(yaw_rad)
+        sin_yaw = np.sin(yaw_rad)
+        
+        vx_world = vx * cos_yaw - vy * sin_yaw
+        vy_world = vx * sin_yaw + vy * cos_yaw
+        vz_world = vz
+
+        # Dérivées position
+        ds_x = vx_world
+        ds_y = vy_world
+        ds_z = vz_world
+
+        # 🔧 MODIF: sécuriser last_angles (évite crash 1ère itération)
+        if self.last_timestamp is not None and hasattr(self, "last_angles"):
+            ds_roll = (roll_rad - self.last_angles[0]) / dt
+            ds_pitch = (pitch_rad - self.last_angles[1]) / dt
+            ds_yaw = (yaw_rad - self.last_angles[2]) / dt
+        else:
+            ds_roll = ds_pitch = ds_yaw = 0.0
+
+        # 🔧 MODIF: sécuriser last_velocities + filtrage
+        if self.last_timestamp is not None and self.last_velocities is not None:
+            raw_ds_vx = (vx_world - self.last_velocities[0]) / dt
+            raw_ds_vy = (vy_world - self.last_velocities[1]) / dt
+            raw_ds_vz = (vz_world - self.last_velocities[2]) / dt
+
+            alpha = 0.9
+            
+            if hasattr(self, "filtered_acc"):
+                ds_vx = alpha * self.filtered_acc[0] + (1 - alpha) * raw_ds_vx
+                ds_vy = alpha * self.filtered_acc[1] + (1 - alpha) * raw_ds_vy
+                ds_vz = alpha * self.filtered_acc[2] + (1 - alpha) * raw_ds_vz
+            else:
+                ds_vx, ds_vy, ds_vz = raw_ds_vx, raw_ds_vy, raw_ds_vz
+
+            self.filtered_acc = (ds_vx, ds_vy, ds_vz)
+        else:
+            ds_vx = ds_vy = ds_vz = 0.0
+
+        # Écriture CSV
+        self.writer.writerow([
+            f"{t:.6f}",
+            f"{self.pos_x:.6f}", f"{self.pos_y:.6f}", f"{self.pos_z:.6f}",
+            f"{roll_rad:.6f}", f"{pitch_rad:.6f}", f"{yaw_rad:.6f}",
+            f"{vx_world:.6f}", f"{vy_world:.6f}", f"{vz_world:.6f}",
+            f"{self.cmd_left_right:.6f}", f"{self.cmd_forward_back:.6f}", 
+            f"{self.cmd_up_down:.6f}", f"{self.cmd_yaw:.6f}",
+            f"{dt:.6f}",
+            f"{ds_x:.6f}", f"{ds_y:.6f}", f"{ds_z:.6f}",
+            f"{ds_roll:.6f}", f"{ds_pitch:.6f}", f"{ds_yaw:.6f}",
+            f"{ds_vx:.6f}", f"{ds_vy:.6f}", f"{ds_vz:.6f}"
+        ])
+
+        self.last_timestamp = t
+        self.last_angles = (roll_rad, pitch_rad, yaw_rad)
+        self.last_velocities = (vx_world, vy_world, vz_world)
+
+    # ============================================
+    # MISSION
+    # ============================================
+    def mission(self):
+        resp = self.sendCommand("command")
+        time.sleep(2)
+        print(f"Batterie : {self.battery}")
+        print(f"Reponse Tello : {resp}")
+        
+        phase = 0
+        
+        # Décollage
+        self.sendCommand("takeoff")
+        time.sleep(3)
+        
+        # Phase 1: Immobile (hover)
+        phase += 1
+        self.rc_control(0, 0, 0, 0)
+        self.get_logger().info(f"Phase {phase}: Immobile (hover)")
+        time.sleep(1)
+        
+        # # Phase 2: Monter
+        # phase += 1
+        # self.rc_control(0, 0, 30, 0)
+        # self.get_logger().info(f"Phase {phase}: Monter")
+        # time.sleep(3)
+        
+        # # Phase 3: Descendre
+        # phase += 1
+        # self.rc_control(0, 0, -30, 0)
+        # self.get_logger().info(f"Phase {phase}: Descendre")
+        # time.sleep(3)
+        
+        # # Phase 4: Avancer
+        # phase += 1
+        # self.rc_control(0, 30, 0, 0)
+        # self.get_logger().info(f"Phase {phase}: Avancer")
+        # time.sleep(3)
+        
+        # # Phase 5: Reculer
+        # phase += 1
+        # self.rc_control(0, -30, 0, 0)
+        # self.get_logger().info(f"Phase {phase}: Reculer")
+        # time.sleep(3)
+        
+        # # Phase 6: Rotation droite
+        # phase += 1
+        # self.rc_control(0, 0, 0, 50)
+        # self.get_logger().info(f"Phase {phase}: Rotation horaire")
+        # time.sleep(3)
+    
+        # # Phase 7: Rotation gauche
+        # phase += 1
+        # self.rc_control(0, 0, 0, -50)
+        # self.get_logger().info(f"Phase {phase}: Rotation anti-horaire")
+        # time.sleep(3)
+
+        # # Phase 8: Cercle à droite
+        # phase += 1
+        # self.rc_control(0, 30, 0, 50)
+        # self.get_logger().info(f"Phase {phase}: Cercle à droite")
+        # time.sleep(3)
+
+        # # Phase 9: Cercle à gauche
+        # phase += 1
+        # self.rc_control(0, 30, 0, -50)
+        # self.get_logger().info(f"Phase {phase}: Cercle à gauche")
+        # time.sleep(3)
+        
+        # # Arrêt
+        # self.rc_control(0, 0, 0, 0)
+        # time.sleep(2)
+        
+        # Atterrissage
+        self.sendCommand("land")
+        self.get_logger().info("Atterrissage terminé")
+        
+        # Fermeture du fichier
+        self.csv_file.close()
+        self.get_logger().info("Dataset sauvegardé dans dataset_neural_ode/drone_data.csv")
+
+def main(args=None):
+    rclpy.init(args=args)
+    tello = TelloROS()
+    
+    mission_thread = threading.Thread(target=tello.mission)
+    mission_thread.start()
+    
+    rclpy.spin(tello)
+    
+    tello.destroy_node()
+    rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
+
+
+# colcon build
+# source install/setup.bash
+# ros2 run tello_pkg tello_node
